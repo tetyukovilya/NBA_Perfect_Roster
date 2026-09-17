@@ -1,0 +1,17 @@
+Starting Five for NBA 2026 Season (based on analysis of Players.csv)
+Method: For each position, we computed a score as the sum of z-scores of selected statistics (higher is better).
+Position-specific statistics:
+PG: ast_percent, stl_percent, tov_percent (inverted), ws, bpm, vorp
+SG: ts_percent, x3p_ar, ws, bpm, vorp, stl_percent
+SF: ts_percent, trb_percent, ws, bpm, vorp, stl_percent
+PF: trb_percent, orb_percent, ws, bpm, vorp, blk_percent
+C: trb_percent, blk_percent, ws, bpm, vorp, ts_percent
+
+Results:
+Point Guard (PG): Shai Gilgeous-Alexander (Score: 14.85)
+Shooting Guard (SG): Matisse Thybulle (Score: 11.52)
+Small Forward (SF): Riley Minix (Score: 11.61)
+Power Forward (PF): Giannis Antetokounmpo (Score: 12.96)
+Center (C): Nikola Jokić (Score: 17.21)
+
+Note: The analysis is based on the 2026 season data from the Players.csv file.
