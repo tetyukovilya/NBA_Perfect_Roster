@@ -9,7 +9,7 @@ OUTPUT_PATH = os.path.join(os.path.dirname(__file__), '..', 'starting_five_2026.
 
 LEAGUE_FG = 0.46  # league average field goal percentage (approx)
 POSSESSIONS_PER_GAME = 100
-NUM_GAMES_SIM = 30  # number of games to simulate for each lineup
+NUM_GAMES_SIM = 10000  # number of games to simulate for each lineup
 
 # weights for chemistry
 W_SIM = 0.6
@@ -154,23 +154,58 @@ def chemistry(p1, p2, co_minutes_dict):
     # clamp to reasonable range, e.g., -0.5 to 0.5
     return max(-0.5, min(0.5, bonus))
 
-def top_unique(players, key, n=5):
-    seen = set()
-    result = []
-    for p in sorted(players, key=lambda x: x[key], reverse=True):
-        if p['player'] not in seen:
-            seen.add(p['player'])
-            result.append(p)
-            if len(result) >= n:
-                break
-    return result
+def lineup_by_position(players, metric):
+    """Return a list of 5 players, one for each position (PG,SG,SF,PF,C),
+    selected by highest metric value among players whose original position matches.
+    If a position lacks players, fall back to best remaining players regardless of position.
+    """
+    positions = ['PG', 'SG', 'SF', 'PF', 'C']
+    used = set()
+    lineup = [None] * 5  # index corresponds to positions order
+    # First pass: try to fill each position with matching original pos
+    for idx, pos in enumerate(positions):
+        # filter players matching position and not used
+        candidates = [p for p in players if p['pos'] == pos and p['player'] not in used]
+        if not candidates:
+            continue
+        # sort by metric descending
+        candidates_sorted = sorted(candidates, key=lambda x: x[metric], reverse=True)
+        best = candidates_sorted[0]
+        lineup[idx] = best
+        used.add(best['player'])
+    # Second pass: fill any remaining slots with best overall remaining players
+    remaining_players = [p for p in players if p['player'] not in used]
+    remaining_sorted = sorted(remaining_players, key=lambda x: x[metric], reverse=True)
+    rem_idx = 0
+    for idx in range(5):
+        if lineup[idx] is None:
+            if rem_idx < len(remaining_sorted):
+                lineup[idx] = remaining_sorted[rem_idx]
+                used.add(lineup[idx]['player'])
+                rem_idx += 1
+            else:
+                # should not happen if enough players
+                lineup[idx] = None
+    # Ensure we have exactly 5 players (filter None)
+    lineup = [p for p in lineup if p is not None]
+    # If still less than 5, just take top remaining (should not happen)
+    if len(lineup) < 5:
+        needed = 5 - len(lineup)
+        extra = [p for p in remaining_sorted if p['player'] not in used][:needed]
+        lineup.extend(extra)
+        for p in extra:
+            used.add(p['player'])
+    return lineup
 
-def format_md(title, five, key):
+def format_md(title, five, metric):
     lines = [f'## {title}\n']
-    for i, p in enumerate(five, 1):
+    positions = ['PG', 'SG', 'SF', 'PF', 'C']
+    for idx, p in enumerate(five):
+        assigned_pos = positions[idx] if idx < len(positions) else 'N/A'
+        original_pos = p['pos']
         lines.append(
-            f'{i}. **{p["player"]}** ({p["team"]} {p["pos"]}, {p["season"]} {p["lg"]}) '
-            f'{key.upper()}:{p[key]:.2f} | OBPM:{p["obpm"]:.2f} DBPM:{p["dbpm"]:.2f} '
+            f'{idx+1}. **{p["player"]}** (Assigned Pos: {assigned_pos}, Original Pos: {original_pos}, {p["team"]}, {p["season"]} {p["lg"]}) '
+            f'{metric.upper()}:{p[metric]:.2f} | OBPM:{p["obpm"]:.2f} DBPM:{p["dbpm"]:.2f} '
             f'VORP:{p["vorp"]:.2f} PER:{p["per"]:.1f}'
         )
     lines.append('')
@@ -238,18 +273,18 @@ def main():
     players = prepare_players(players)
     co_minutes = compute_co_play_minutes(players)
     
-    # compute top lineups
-    overall = top_unique(players, 'ws')
-    offense = top_unique(players, 'ows')
-    defense = top_unique(players, 'dws')
+    # compute position-specific lineups
+    overall = lineup_by_position(players, 'ws')
+    offense = lineup_by_position(players, 'ows')
+    defense = lineup_by_position(players, 'dws')
     
     # Build markdown content
     md_lines = []
-    md_lines.append('# Best Overall Five (Win Shares) – All Time')
+    md_lines.append('# Best Overall Five (Win Shares) – All Time (One per Position)')
     md_lines.append(format_md('Best Overall Five (WS)', overall, 'ws'))
-    md_lines.append('# Best Offensive Five (Offensive Win Shares) – All Time')
+    md_lines.append('# Best Offensive Five (Offensive Win Shares) – All Time (One per Position)')
     md_lines.append(format_md('Best Offensive Five (OWS)', offense, 'ows'))
-    md_lines.append('# Best Defensive Five (Defensive Win Shares) – All Time')
+    md_lines.append('# Best Defensive Five (Defensive Win Shares) – All Time (One per Position)')
     md_lines.append(format_md('Best Defensive Five (DWS)', defense, 'dws'))
     
     # Simulation section

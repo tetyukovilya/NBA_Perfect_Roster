@@ -1,6 +1,7 @@
 # NBA Проект
 
-Этот проект анализирует исторические данные игроков NBA/ABA, чтобы определить лучшие общие, атакующие и защитные пятерки игроков. Он выходит за рамки простого ранжирования, моделируя игры между составами с учётом химии игроков (похожести стиля игры и共同 игрового времени).
+Этот проект анализирует исторические данные игроков NBA/ABA, чтобы определить лучшие общие, атакующие и защитные пятерки игроков с учётом позиции (по одному игроку на каждую позицию: PG, SG, SF, PF, C) и без повторяющихся игроков. 
+Помимо простого ранжирования по статистике, проект моделирует игры между составами, учитывая химию игроков (похожесть стиля игры и共同 игровое время).
 
 ## Структура репозитория
 ```
@@ -28,11 +29,11 @@ NBA_project/
   - `player`, `team`, `pos`, `season`, `lg`
 
 ## Возможности
-1. **Статистическое ранжирование**
-   - Лучшая общая пятерка (по WS)
-   - Лучшая атакующая пятерка (по OWS)
-   - Лучшая защитная пятерка (по DWS)
-   - Дубликаты игроков удаляются – каждый игрок встречается не более одного раза в каждом списке.
+1. **Статистическое ранжирование с позициями**
+   - Лучшая общая пятерка (по WS) – по одному игроку на каждую позицию
+   - Лучшая атакующая пятерка (по OWS) – по одному игроку на каждую позицию
+   - Лучшая защитная пятерка (по DWS) – по одному игроку на каждую позицию
+   - В каждом списке отсутствуют дубликаты игроков; также нет двух игроков на одной позиции.
 
 2. **Симуляция с учётом химии**
    - Каждому игроку присваиваются нормализованные показатели атаки и защиты.
@@ -43,12 +44,17 @@ NBA_project/
              - w3 * |usage_i - usage_j|
      ```
      где вектор навыков = [offs, defs, 3p%, ast%, trb%]
-   - Podczas posiadania piłki prawdopodobieństwo trafnego rzutu jest zwiększane przez sumę chemii z kolegami z drużyny.
-   - Symulowane gry składają się z konfigurowalnej liczby posiadania (domyślnie 100 na mecz).
-   - Skrypt przeprowadza rozgrywkę systemem „każdy z każdym” (domyślnie 30 meczów na każdy pojedynek) i raportuje średnią różnicę punktową na mecz.
+   - При владении мячом вероятность успешного броска повышается на величину, равную суммарному показателю сыгранности с партнерами по команде.
+   - Симулируемые матчи состоят из настраиваемого количества владений (по умолчанию — 100 за игру).
+   - Скрипт проводит серию матчей по круговой системе (по умолчанию — 30 игр в рамках противостояния) и вычисляет среднюю разницу в счете за игру.
 
 3. **Вывод в markdown**
    - Результаты записываются в `starting_five_2026.md` с четкими заголовками, таблицами и подведением итогов симуляции.
+   - Для каждого игрока указаны:
+     - assigned position (позиция, которую мы ему назначили в составе)
+     - original position (позиция, указанная в исходном файле Players.csv)
+     - команда, сезон, лига
+     - значение метрики (WS, OWS или DWS) и дополнительные показатели (OBPM, DBPM, VORP, PER)
 
 ## Требования
 - Python 3.8+
@@ -70,16 +76,16 @@ python src/analyze_nba.py
 
 Скрипт выполнит следующие действия:
 - Загрузит и нормализует данные игроков.
-- Посчитает три лучшие пятерки игроков (без повторяющихся игроков).
+- Посчитает три лучшие пятерки игроков (по одному на позицию, без повторяющихся игроков).
 - Запустит симуляцию игр между составами с учётом химии.
 - Запишет результаты в `starting_five_2026.md`.
 
 ### Пример вывода (фрагмент)
 ```
-# Лучшая общая пятерка (Win Shares) – Все время
+# Лучшая общая пятерка (Win Shares) – Все время (по позициям)
 ## Лучшая общая пятерка (WS)
-1. **Michael Jordan** (CHI SG, 1988 NBA) WS:21.20 | OBPM:8.80 DBPM:4.20 VORP:12.50 PER:31.7
-2. **LeBron James** (CLE SF, 2009 NBA) WS:20.30 | OBPM:9.50 DBPM:3.70 VORP:11.80 PER:31.7
+1. **Michael Jordan** (Assigned Pos: PG, Original Pos: SG, CHI, 1988 NBA) WS:21.20 | OBPM:8.80 DBPM:4.20 VORP:12.50 PER:31.7
+2. **LeBron James** (Assigned Pos: SG, Original Pos: SF, CLE, 2009 NBA) WS:20.30 | OBPM:9.50 DBPM:3.70 VORP:11.80 PER:31.7
 ...
 
 # Результаты симуляции (с учётом химии)
@@ -105,7 +111,7 @@ python src/analyze_nba.py
 - Чтобы изменить путь к выходному файлу, поправьте переменную `OUTPUT_PATH`.
 
 ## Расширение проекта
-- **Другие пятерки**: генерировать составы по другим метрикам (например, PER, VORP), вызывая `top_unique` с другим ключом.
+- **Другие пятерки**: генерировать составы по другим метрикам (например, PER, VORP), вызывая функцию lineup_by_position с другим ключом.
 - **Более сложная симуляция**: добавить модели штрафных бросков, потерь, фолов, усталости, ротаций составов.
 - **Машинное обучение**: рассматривать разницу очков симуляции как метку и обучать регрессионную модель, которая предсказывает эффективность состава напрямую из агрегированной статистики игроков.
 - **Визуализация**: строить графы химии, распределения результатов симуляции или тепловые карты win-rate с помощью `matplotlib` или `seaborn` (требуется добавить эти пакеты в `requirements.txt`).
@@ -118,124 +124,3 @@ python src/analyze_nba.py
 - Сообщество открытого исходного кода за инструменты и вдохновение.
 
 Приятного анализа данных и моделирования dream team! 🚀
-
-# NBA Project
-
-This project analyzes historical NBA/ABA player data to determine the best overall, offensive, and defensive five‑player line‑ups. It goes beyond simple ranking by simulating games between line‑ups while accounting for player chemistry (playstyle similarity and shared minutes).
-
-## Repository Structure
-```
-NBA_project/
-├─ data/
-│   └─ Players.csv          # raw player‑season statistics (source)
-├─ src/
-│   ├─ __init__.py
-│   └─ analyze_nba.py       # main script: loads data, computes line‑ups, runs simulation
-├─ starting_five_2026.md    # results in markdown format (generated by analyze_nba.py)
-└─ README.md                # this file
-```
-
-## Data Source
-- `data/Players.csv` contains per‑player advanced statistics for multiple seasons (including NBA and ABA).
-- Key columns used:
-  - `ows` – Offensive Win Shares
-  - `dws` – Defensive Win Shares
-  - `ws` – Win Shares (overall)
-  - `obpm`, `dbpm` – Offensive/Defensive Box Plus/Minus
-  - `vorp` – Value Over Replacement Player
-  - `per` – Player Efficiency Rating
-  - `usg_percent` – Usage Rate
-  - `ast_percent`, `stl_percent`, `blk_percent`, `tov_percent`, `reb_percent`, `ts_percent`, `x3p_ar`, `f_tr`, `mp`
-  - `player`, `team`, `pos`, `season`, `lg`
-
-## Features
-1. **Statistical Ranking**
-   - Best Overall Five (by WS)
-   - Best Offensive Five (by OWS)
-   - Best Defensive Five (by DWS)
-   - Duplicate players are removed – each player appears at most once per list.
-
-2. **Chemistry‑Aware Simulation**
-   - Each player receives normalized offensive/defensive skill scores.
-   - Chemistry between two players is computed as:
-     ```
-     chemistry = w1 * cosine_similarity(skill_vec_i, skill_vec_j)
-                 + w2 * log(1 + co_play_minutes_ij)
-                 - w3 * |usage_i - usage_j|
-     ```
-     where `skill_vec = [offs, defs, 3p%, ast%, trb%]`
-   - During a possession, the ball handler’s shot probability is boosted by the sum of chemistries with his teammates.
-   - Simulated games consist of a configurable number of possessions (default 100 per game).
-   - The script runs a round‑robin series (30 games per matchup by default) and reports the average point difference per game.
-
-3. **Markdown Output**
-   - Results are written to `starting_five_2026.md` with clear headings, tables, and simulation summary.
-
-## Requirements
-- Python 3.8+
-- Standard library only (no external dependencies).  
-  The script uses `csv`, `os`, `math`, `random`, `collections`.
-
-## Installation
-1. Clone or copy this repository to your desired location.
-2. Ensure the `data/Players.csv` file is present (it is included in the repo).
-3. No additional packages are required.
-
-## Usage
-Run the analysis and simulation from the project root:
-
-```bash
-cd path/to/NBA_project
-python src/analyze_nba.py
-```
-
-The script will:
-- Load and normalize player data.
-- Compute the three best five‑player line‑ups (no duplicate players).
-- Simulate games between the line‑ups using the chemistry model.
-- Write the results to `starting_five_2026.md`.
-
-### Example Output (excerpt)
-```
-# Best Overall Five (Win Shares) – All Time
-## Best Overall Five (WS)
-1. **Michael Jordan** (CHI SG, 1988 NBA) WS:21.20 | OBPM:8.80 DBPM:4.20 VORP:12.50 PER:31.7
-2. **LeBron James** (CLE SF, 2009 NBA) WS:20.30 | OBPM:9.50 DBPM:3.70 VORP:11.80 PER:31.7
-...
-
-# Simulation Results (Chemistry Adjusted)
-Each lineup simulated 30 games against each of the other two lineups.
-Chemistry bonus weight: 0.1 (scale factor).
-
-## Overall Lineup
-Average point difference per game vs other lineups: 8.87 points
-
-## Offense Lineup
-Average point difference per game vs other lineups: -7.93 points
-
-## Defense Lineup
-Average point difference per game vs other lineups: 13.03 points
-```
-
-## Customization
-- Adjust constants at the top of `src/analyze_nba.py`:
-  - `LEAGUE_FG` – league average field goal percentage.
-  - `POSSESSIONS_PER_GAME` – possessions per simulated game.
-  - `NUM_GAMES_SIM` – number of games each lineup plays against each opponent.
-  - `W_SIM`, `W_CO`, `W_USG_DIFF` – weights for the chemistry formula.
-- To change the output file location, modify `OUTPUT_PATH`.
-
-## Extending the Project
-- **Additional Line‑ups**: generate line‑ups based on other metrics (e.g., PER, VORP) by calling `top_unique` with a different key.
-- **More Sophisticated Simulation**: incorporate play‑by‑play types (free throws, turnovers, fouls), fatigue models, or lineup‑specific rotations.
-- **Machine Learning**: treat the simulated point difference as a label and train a regression model to predict lineup performance directly from aggregated player statistics.
-- **Visualization**: plot chemistry networks, simulation distributions, or win‑rate heatmaps using `matplotlib` or `seaborn` (would require adding those packages to `requirements.txt`).
-
-## License
-This project is for educational and personal use. Feel free to adapt and expand it as you wish.
-
-## Acknowledgments
-- Basketball‑Reference and other public sources for the underlying statistics.
-- The open‑source community for tools and inspiration.
-
-Enjoy exploring the data and simulating dream teams! 🚀
