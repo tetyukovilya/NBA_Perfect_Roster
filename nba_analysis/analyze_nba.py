@@ -3,6 +3,8 @@ import os
 import math
 import random
 from collections import defaultdict
+from dataclasses import dataclass
+from typing import List, Dict, Optional, Tuple
 
 DATA_PATH = os.path.join(os.path.dirname(__file__), '..', 'data', 'Players.csv')
 OUTPUT_PATH = os.path.join(os.path.dirname(__file__), '..', 'starting_five_2026.md')
@@ -15,6 +17,18 @@ NUM_GAMES_SIM = 10000  # number of games to simulate for each lineup
 W_SIM = 0.6
 W_CO = 0.3
 W_USG_DIFF = 0.1
+
+# Position normalization map (handles hybrid positions from Basketball-Reference)
+POS_MAP = {
+    'PG': 'PG', 'SG': 'SG', 'SF': 'SF', 'PF': 'PF', 'C': 'C',
+    'G': 'PG', 'F': 'SF', 'G-F': 'SG', 'F-G': 'SG',
+    'F-C': 'PF', 'C-F': 'PF', 'C-PF': 'PF', 'PF-C': 'PF',
+    'SG-SF': 'SG', 'SF-SG': 'SF', 'PG-SG': 'PG', 'SG-PG': 'SG',
+}
+
+def normalize_position(pos: str) -> str:
+    """Map hybrid/alternate positions to standard 5 positions."""
+    return POS_MAP.get(pos.strip().upper(), 'SF')  # default to SF if unknown
 
 def load_players():
     players = []
@@ -51,7 +65,8 @@ def load_players():
                 players.append({
                     'player': player,
                     'team': team,
-                    'pos': pos,
+                    'pos': normalize_position(pos),  # normalized position
+                    'original_pos': pos,  # keep original for display
                     'season': season,
                     'lg': lg,
                     'ows': ows,
@@ -144,15 +159,44 @@ def cosine_similarity(v1, v2):
         return 0.0
     return dot / (norm1 * norm2)
 
+# Global cache for chemistry calculations
+_chemistry_cache = {}
+_team_chem_cache = {}
+
 def chemistry(p1, p2, co_minutes_dict):
-    """Chemistry bonus between two players (0-1 ish)."""
+    """Chemistry bonus between two players (0-1 ish). Cached."""
+    key = (p1['player'], p2['player'])
+    if key in _chemistry_cache:
+        return _chemistry_cache[key]
+    
     sim = cosine_similarity(p1['vec'], p2['vec'])
     co = co_minutes_dict.get((p1['player'], p2['player']), 0.0)
     co_log = math.log1p(co)  # log(1+co)
     usg_diff = abs(p1['usage'] - p2['usage'])
     bonus = W_SIM * sim + W_CO * co_log - W_USG_DIFF * usg_diff
     # clamp to reasonable range, e.g., -0.5 to 0.5
-    return max(-0.5, min(0.5, bonus))
+    result = max(-0.5, min(0.5, bonus))
+    _chemistry_cache[key] = result
+    return result
+
+def get_team_chemistry_sum(ball_handler, offense, co_minutes_dict):
+    """Cached sum of chemistry between ball_handler and all teammates."""
+    # Create a cache key from the team composition
+    team_players = tuple(sorted(p['player'] for p in offense))
+    key = (ball_handler['player'], team_players)
+    if key in _team_chem_cache:
+        return _team_chem_cache[key]
+    
+    chem_sum = sum(chemistry(ball_handler, teammate, co_minutes_dict) 
+                   for teammate in offense if teammate is not ball_handler)
+    _team_chem_cache[key] = chem_sum
+    return chem_sum
+
+def clear_chemistry_cache():
+    """Clear the chemistry cache between simulation runs."""
+    global _chemistry_cache, _team_chem_cache
+    _chemistry_cache = {}
+    _team_chem_cache = {}
 
 def lineup_by_position(players, metric):
     """Return a list of 5 players, one for each position (PG,SG,SF,PF,C),
@@ -202,7 +246,7 @@ def format_md(title, five, metric):
     positions = ['PG', 'SG', 'SF', 'PF', 'C']
     for idx, p in enumerate(five):
         assigned_pos = positions[idx] if idx < len(positions) else 'N/A'
-        original_pos = p['pos']
+        original_pos = p.get('original_pos', p['pos'])
         lines.append(
             f'{idx+1}. **{p["player"]}** (Assigned Pos: {assigned_pos}, Original Pos: {original_pos}, {p["team"]}, {p["season"]} {p["lg"]}) '
             f'{metric.upper()}:{p[metric]:.2f} | OBPM:{p["obpm"]:.2f} DBPM:{p["dbpm"]:.2f} '
@@ -211,7 +255,7 @@ def format_md(title, five, metric):
     lines.append('')
     return '\n'.join(lines)
 
-def possession(offense, defense, chem_bonus):
+def possession(offense, defense, chem_bonus, co_minutes_dict):
     """Simulate one possession; return points scored by offense and which team gets rebound if miss."""
     # choose ball handler weighted by usage
     ball_handler = random.choices(offense, weights=[p['usage'] for p in offense])[0]
@@ -219,8 +263,8 @@ def possession(offense, defense, chem_bonus):
     defender = random.choices(defense, weights=[p['defs'] for p in defense])[0]
     # base success probability
     p_shot = ball_handler['offs'] * (1 - defender['defs']) * LEAGUE_FG
-    # chemistry boost from teammates on floor (excluding ball handler)
-    chem = sum(chemistry(ball_handler, teammate, {}) for teammate in offense if teammate is not ball_handler)
+    # chemistry boost from teammates on floor (excluding ball handler) - cached
+    chem = get_team_chemistry_sum(ball_handler, offense, co_minutes_dict)
     p_shot *= (1 + chem_bonus * chem)  # chem_bonus scales overall chemistry influence
     # clamp
     p_shot = max(0.0, min(0.9, p_shot))
@@ -243,27 +287,45 @@ def possession(offense, defense, chem_bonus):
                 reb_team = 'def'
         return 0, reb_team
 
-def simulate_game(lineup_a, lineup_b, chem_bonus=0.1, possessions=POSSESSIONS_PER_GAME):
+def simulate_game(lineup_a, lineup_b, chem_bonus=0.1, possessions=POSSESSIONS_PER_GAME, co_minutes_dict=None):
+    if co_minutes_dict is None:
+        co_minutes_dict = {}
     score_a = 0
     score_b = 0
-    for _ in range(possessions):
-        pts, reb = possession(lineup_a, lineup_b, chem_bonus)
-        score_a += pts
-        if reb == 'off':
-            continue  # offense retains ball, simulate another possession for same offense? we'll just continue loop (possession counted)
-        pts2, reb2 = possession(lineup_b, lineup_a, chem_bonus)
-        score_b += pts2
-        if reb2 == 'off':
-            continue
+    # Track possession properly: offensive rebound doesn't count as new possession
+    possessions_played = 0
+    offense_has_ball = True  # True = lineup_a has ball, False = lineup_b has ball
+    while possessions_played < possessions:
+        if offense_has_ball:
+            pts, reb = possession(lineup_a, lineup_b, chem_bonus, co_minutes_dict)
+            score_a += pts
+        else:
+            pts, reb = possession(lineup_b, lineup_a, chem_bonus, co_minutes_dict)
+            score_b += pts
+        
+        if reb is None:
+            # made shot - possession ends, other team gets ball
+            offense_has_ball = not offense_has_ball
+            possessions_played += 1
+        elif reb == 'off':
+            # offensive rebound - same team keeps ball, possession continues (don't increment counter)
+            pass
+        else:
+            # defensive rebound - other team gets ball
+            offense_has_ball = not offense_has_ball
+            possessions_played += 1
     return score_a, score_b
 
-def evaluate_lineup(lineup, opponents, chem_bonus=0.1, games=NUM_GAMES_SIM):
+def evaluate_lineup(lineup, opponents, chem_bonus=0.1, games=NUM_GAMES_SIM, co_minutes_dict=None):
     """Play 'games' number of games against each opponent lineup, return average point difference."""
+    if co_minutes_dict is None:
+        co_minutes_dict = {}
+    clear_chemistry_cache()  # Clear cache since team composition changes
     total_diff = 0.0
     total_games = 0
     for opp in opponents:
         for _ in range(games):
-            a, b = simulate_game(lineup, opp, chem_bonus)
+            a, b = simulate_game(lineup, opp, chem_bonus, co_minutes_dict=co_minutes_dict)
             total_diff += (a - b)
             total_games += 1
     return total_diff / total_games if total_games else 0.0
@@ -289,15 +351,15 @@ def main():
     
     # Simulation section
     md_lines.append('# Simulation Results (Chemistry Adjusted)')
-    md_lines.append('Each lineup simulated 30 games against each of the other two lineups.')
-    md_lines.append('Chemistry bonus weight: 0.1 (scale factor).')
+    md_lines.append(f'Each lineup simulated {NUM_GAMES_SIM} games against each of the other two lineups.')
+    md_lines.append(f'Chemistry bonus weight: 0.1 (scale factor).')
     md_lines.append('')
     
     lineups = [('Overall', overall), ('Offense', offense), ('Defense', defense)]
     # compute avg point diff vs others
     for name_i, lineup_i in lineups:
         opps = [lineup_j for name_j, lineup_j in lineups if name_j != name_i]
-        avg_diff = evaluate_lineup(lineup_i, opps, chem_bonus=0.1)
+        avg_diff = evaluate_lineup(lineup_i, opps, chem_bonus=0.1, co_minutes_dict=co_minutes)
         md_lines.append(f'## {name_i} Lineup')
         md_lines.append(f'Average point difference per game vs other lineups: {avg_diff:.2f} points')
         md_lines.append('')
