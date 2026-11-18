@@ -1,13 +1,17 @@
 """Игроки-агенты: каждый принимает решения на основе своего профиля.
 
 Решение принимается каждый тик (2 секунды):
-    SHOOT   — бросок из текущей позиции
-    FAKE    — финт броском (pump fake); если защитник клюёт, следующий
-              бросок идёт с бонусом и без contest
-    DRIVE   — прорыв к кольцу с ведением (риск потери/перехвата)
-    MOVE    — смещение в свободную зону без мяча у партнёра или
-              отстройка с мячом
-    PASS    — пас наиболее открытому партнёру (риск перехвата)
+    SHOOT     — бросок из текущей позиции
+    FAKE      — финт броском (pump fake); если защитник клюёт,
+                следующий бросок идёт с бонусом и без contest
+    CROSSOVER — обводка с ведением; успех — защитник остаётся стоять,
+                неудача — риск потерять мяч
+    SCREEN    — партнёр ставит заслон на защитника владельца мяча;
+                успех — защитник врезается в заслон (стоит 2 тика),
+                дальше возможна подмена (switch)
+    DRIVE     — прорыв к кольцу с ведением (риск потери/фола)
+    MOVE      — смещение в свободную зону
+    PASS      — пас партнёру (риск перехвата)
 
 Пассивные свойства агента берутся из PlayerProfile (profiles.py), чтобы
 текстовая игра давала те же вероятности, что и Monte-Carlo симуляция.
@@ -22,13 +26,17 @@ from ..profiles import PlayerProfile
 
 # Скорость движения за тик (усл. ед./2 сек) по позициям: защитники быстрее.
 SPEED_BY_POS = {"PG": 2.2, "SG": 2.1, "SF": 2.0, "PF": 1.8, "C": 1.6}
-# На сколько защитник «отпускает» подальнего/менее опасного игрока.
+# Насколько защитник «отпускает» подальнего/менее опасного игрока.
 SAG_BY_POS = {"PG": 1.0, "SG": 1.4, "SF": 1.6, "PF": 1.8, "C": 2.0}
+# Склонность идти в обводку по позициям (защитники чаще).
+CROSSOVER_P = {"PG": 0.25, "SG": 0.20, "SF": 0.12, "PF": 0.06, "C": 0.03}
 
 
 class Action(Enum):
     SHOOT = "shoot"
     FAKE = "fake"
+    CROSSOVER = "crossover"
+    SCREEN = "screen"
     DRIVE = "drive"
     MOVE = "move"
     PASS = "pass"
@@ -58,10 +66,17 @@ class PlayerAgent:
         self.y = y
         self.rng = rng
         self.speed = SPEED_BY_POS.get(pos, 2.0)
-        # Бонус после успешного финта: следующий бросок открыт.
-        self.fake_open_until = -1
-        # Агрессивность защиты: чем выше STL%, тем ближе лезет защитник.
+        # Агрессивность защиты: чем выше STL%, тем ближе лезет защитник
+        # (и тем чаще фолит/кушает на финты).
         self.pressure = min(profile.stl / 2.5, 1.0)
+        # Игрок «открыт» (защитник обведён/врезался в заслон) до этого тика.
+        self.open_until = -1
+        # Число тиков, которые защитник стоит на месте (заслон/обводка).
+        self.frozen = 0
+        # Личные фолы за игру.
+        self.personal_fouls = 0
+        # Домашняя точка расстановки — сюда игрок встаёт в новом владении.
+        self.home = (x, y)
 
     @property
     def name(self) -> str:
@@ -89,11 +104,11 @@ class PlayerAgent:
     ) -> Decision:
         rng = self.rng
         p = self.profile
-        fake_open = self.fake_open_until > 0 and tick <= self.fake_open_until
-        open_shot = nearest_def_dist >= 2.2 or fake_open
+        beat_open = self.open_until >= tick  # защитник уже обыгран
+        open_shot = nearest_def_dist >= 2.2 or beat_open
 
-        # После успешного финта защитник в воздухе — бросаем почти всегда.
-        if fake_open and zone.value != "backcourt" and rng.random() < 0.85:
+        # После успешного обыгрыша защитник позади — бросаем почти всегда.
+        if beat_open and zone.value != "backcourt" and rng.random() < 0.85:
             return Decision(Action.SHOOT)
 
         # Совсем открытый и в хорошей зоне — бросаем не раздумывая.
@@ -103,15 +118,27 @@ class PlayerAgent:
             if zone.value in ("midrange", "arc_three") and rng.random() < 0.6 + p.three_rate:
                 return Decision(Action.SHOOT)
 
-        # До конца владения мало времени — вынужденный бросок.
-        # (вызов решает движок; здесь просто эвристики свободы)
+        has_big = any(t.pos in ("PF", "C") for t in teammates)
 
-        # Мяч к нам плотно прижали: либо финт, либо пас, либо прорыв.
+        # Мяч к нам плотно прижали: финт / обводка / прорыв / пас.
         if nearest_def_dist < 1.6:
             roll = rng.random()
-            if roll < 0.25:
+            if roll < 0.22:
                 return Decision(Action.FAKE)
-            if roll < 0.55:
+            if roll < 0.22 + CROSSOVER_P.get(self.pos, 0.1):
+                return Decision(Action.CROSSOVER)
+            if roll < 0.62:
+                return Decision(Action.DRIVE, (0.5, 0.0))
+            return self._best_pass(teammates)
+
+        # Плотная, но не давящая опека: заслон или обыгрыш.
+        if nearest_def_dist < 2.8:
+            roll = rng.random()
+            if roll < 0.30 and has_big:
+                return Decision(Action.SCREEN)
+            if roll < 0.30 + CROSSOVER_P.get(self.pos, 0.1):
+                return Decision(Action.CROSSOVER)
+            if roll < 0.60:
                 return Decision(Action.DRIVE, (0.5, 0.0))
             return self._best_pass(teammates)
 
@@ -138,7 +165,12 @@ class PlayerAgent:
 
     # --- решения в защите ---------------------------------------------------
     def defend_update(self, mark: "PlayerAgent", court) -> None:
-        """Держать дистанцию между своим игроком и кольцом."""
+        """Держать дистанцию между своим игроком и кольцом.
+
+        «Замороженный» защитник (врезался в заслон, обведён) тик стоит.
+        """
+        if self.frozen > 0:
+            return
         sag = SAG_BY_POS.get(mark.pos, 1.5) * (1.0 - 0.5 * self.pressure)
         tx = mark.x * (1 + sag * 0.15)
         ty = mark.y * (1 + sag * 0.15)

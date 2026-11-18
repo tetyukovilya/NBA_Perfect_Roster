@@ -13,6 +13,7 @@ dependencies = []
 [project.scripts]
 nba-analysis = "nba_analysis.cli:main"
 nba-game = "nba_analysis.textgame.demo:main"
+nba-game-gui = "nba_analysis.textgame.gui:main"
 
 [project.optional-dependencies]
 dev = [

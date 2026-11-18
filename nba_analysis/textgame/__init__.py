@@ -12,10 +12,10 @@
 """
 from .court import Court, ShotZone, zone_at
 from .actors import PlayerAgent, Action, Decision
-from .engine import PossessionResult, simulate_possession, simulate_game
+from .engine import GameState, PossessionResult, simulate_possession, simulate_game
 
 __all__ = [
     "Court", "ShotZone", "zone_at",
     "PlayerAgent", "Action", "Decision",
-    "PossessionResult", "simulate_possession", "simulate_game",
+    "GameState", "PossessionResult", "simulate_possession", "simulate_game",
 ]
