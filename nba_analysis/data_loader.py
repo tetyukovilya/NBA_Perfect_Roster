@@ -1,117 +1,107 @@
-"""Data loading and preprocessing for NBA player data."""
-import csv
-import os
-from typing import List, Dict
-from collections import defaultdict
+"""Загрузка Players.csv и фильтрация строк."""
+from __future__ import annotations
 
-from .config import DATA_PATH, POS_MAP, DEFAULT_POSITION
+import csv
+from collections.abc import Iterable
+from pathlib import Path
+
+from .config import DATA_PATH, DEFAULT_POSITION, POS_MAP
 from .models import Player
 
-
-def normalize_position(pos: str) -> str:
-    """Map hybrid/alternate positions to standard 5 positions."""
-    return POS_MAP.get(pos.strip().upper(), DEFAULT_POSITION)
-
-
-def load_players() -> List[Player]:
-    """Load players from CSV file."""
-    players = []
-    with open(DATA_PATH, newline='', encoding='utf-8') as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            try:
-                player = Player(
-                    player=row.get('player', '').strip(),
-                    team=row.get('team', '').strip(),
-                    pos=normalize_position(row.get('pos', '')),
-                    original_pos=row.get('pos', '').strip(),
-                    season=row.get('season', '').strip(),
-                    lg=row.get('lg', '').strip(),
-                    ows=float(row.get('ows', 0) or 0),
-                    dws=float(row.get('dws', 0) or 0),
-                    ws=float(row.get('ws', 0) or 0),
-                    obpm=float(row.get('obpm', 0) or 0),
-                    dbpm=float(row.get('dbpm', 0) or 0),
-                    vorp=float(row.get('vorp', 0) or 0),
-                    per=float(row.get('per', 0) or 0),
-                    usg=float(row.get('usg_percent', 0) or 0),
-                    ast=float(row.get('ast_percent', 0) or 0),
-                    stl=float(row.get('stl_percent', 0) or 0),
-                    blk=float(row.get('blk_percent', 0) or 0),
-                    tov=float(row.get('tov_percent', 0) or 0),
-                    orb=float(row.get('orb_percent', 0) or 0),
-                    drb=float(row.get('drb_percent', 0) or 0),
-                    trb=float(row.get('trb_percent', 0) or 0),
-                    ts=float(row.get('ts_percent', 0) or 0),
-                    x3p_ar=float(row.get('x3p_ar', 0) or 0),
-                    f_tr=float(row.get('f_tr', 0) or 0),
-                    mp=float(row.get('mp', 0) or 0),
-                )
-                if player.player:
-                    players.append(player)
-            except ValueError:
-                continue
-    return players
+_FLOAT_COLUMNS = (
+    "mp", "per", "ts_percent", "x3p_ar", "f_tr", "orb_percent", "drb_percent",
+    "trb_percent", "ast_percent", "stl_percent", "blk_percent", "tov_percent",
+    "usg_percent", "ows", "dws", "ws", "ws_48", "obpm", "dbpm", "bpm", "vorp",
+)
 
 
-def normalize_stat(vals: List[float]) -> List[float]:
-    """Normalize a list of numbers to 0-1 range; if all equal, return 0.5."""
-    if not vals:
-        return []
-    v_min = min(vals)
-    v_max = max(vals)
-    if v_max == v_min:
-        return [0.5] * len(vals)
-    return [(v - v_min) / (v_max - v_min) for v in vals]
+def normalize_position(pos: str | None) -> str:
+    """Свести гибридную/неизвестную позицию к одной из пяти стандартных."""
+    return POS_MAP.get((pos or "").strip().upper(), DEFAULT_POSITION)
 
 
-def prepare_players(players: List[Player]) -> List[Player]:
-    """Add normalized attributes and compute chemistry vectors."""
-    # Extract raw lists for normalization
-    ows_vals = [p.ows for p in players]
-    dws_vals = [p.dws for p in players]
-    usg_vals = [p.usg for p in players]
-    ast_vals = [p.ast for p in players]
-    x3p_vals = [p.x3p_ar for p in players]
-    trb_vals = [p.trb for p in players]
-    
-    # Normalize
-    ows_norm = normalize_stat(ows_vals)
-    dws_norm = normalize_stat(dws_vals)
-    usg_norm = normalize_stat(usg_vals)
-    ast_norm = normalize_stat(ast_vals)
-    x3p_norm = normalize_stat(x3p_vals)
-    trb_norm = normalize_stat(trb_vals)
-    
-    for i, p in enumerate(players):
-        p.offs = ows_norm[i]
-        p.defs = dws_norm[i]
-        p.usage = usg_norm[i]
-        p.ast_norm = ast_norm[i]
-        p.x3p = x3p_norm[i]
-        p.trb_norm = trb_norm[i]
-        # Vector for chemistry similarity: [offs, defs, 3p%, ast%, trb%]
-        p.vec = [p.offs, p.defs, p.x3p, p.ast_norm, p.trb_norm]
-    
-    return players
+def _to_float(raw: str | None) -> float | None:
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        return None
 
 
-def compute_co_play_minutes(players: List[Player]) -> Dict[tuple, float]:
-    """Return dict mapping (player_i, player_j) -> total minutes played together."""
-    # Group by (season, team)
-    season_team_players = defaultdict(list)
+def _to_int(raw: str | None) -> int | None:
+    value = _to_float(raw)
+    return None if value is None else int(value)
+
+
+def parse_row(row: dict[str, str]) -> Player | None:
+    """Строка CSV -> Player; None, если строка непригодна (нет имени/id/сезона)."""
+    name = (row.get("player") or "").strip()
+    player_id = (row.get("player_id") or "").strip()
+    season = _to_int(row.get("season"))
+    if not name or not player_id or season is None:
+        return None
+    raw_pos = (row.get("pos") or "").strip()
+    return Player(
+        player_id=player_id,
+        name=name,
+        season=season,
+        lg=(row.get("lg") or "").strip(),
+        team=(row.get("team") or "").strip(),
+        pos=normalize_position(raw_pos),
+        original_pos=raw_pos,
+        age=_to_int(row.get("age")),
+        g=_to_int(row.get("g")) or 0,
+        **{col: _to_float(row.get(col)) for col in _FLOAT_COLUMNS},
+    )
+
+
+def load_players(path: Path | str = DATA_PATH) -> list[Player]:
+    """Прочитать все строки CSV (включая и суммарные, и покомандные)."""
+    with open(path, newline="", encoding="utf-8") as f:
+        return [p for p in map(parse_row, csv.DictReader(f)) if p is not None]
+
+
+def season_rows(players: Iterable[Player]) -> list[Player]:
+    """По одной строке на игрока за сезон.
+
+    Для игроков, сменивших клуб, в данных есть суммарная строка (2TM/3TM)
+    и строки по каждому клубу. Для сезонных рейтингов берём суммарную,
+    иначе обмен «размазывает» сезон и лучший игрок может не попасть в топ.
+    """
+    players = list(players)
+    aggregated = {(p.player_id, p.season, p.lg) for p in players if p.is_aggregate}
+    return [
+        p for p in players
+        if p.is_aggregate or (p.player_id, p.season, p.lg) not in aggregated
+    ]
+
+
+def team_rows(players: Iterable[Player]) -> list[Player]:
+    """Только покомандные строки (без 2TM/3TM) — для подсчёта совместных минут."""
+    return [p for p in players if not p.is_aggregate]
+
+
+def filter_players(
+    players: Iterable[Player],
+    *,
+    min_minutes: float = 0.0,
+    season_from: int | None = None,
+    season_to: int | None = None,
+    leagues: Iterable[str] | None = None,
+) -> list[Player]:
+    """Отфильтровать строки по минутам, диапазону сезонов и лигам."""
+    league_set = set(leagues) if leagues is not None else None
+    result = []
     for p in players:
-        key = (p.season, p.team)
-        season_team_players[key].append(p)
-    
-    co_minutes = defaultdict(float)
-    for group in season_team_players.values():
-        for i in range(len(group)):
-            pi = group[i]
-            for j in range(i + 1, len(group)):
-                pj = group[j]
-                shared = min(pi.mp, pj.mp)
-                if shared > 0:
-                    co_minutes[(pi.player, pj.player)] += shared
-                    co_minutes[(pj.player, pi.player)] += shared
-    return dict(co_minutes)
+        if min_minutes > 0 and (p.mp or 0.0) < min_minutes:
+            continue
+        if season_from is not None and p.season < season_from:
+            continue
+        if season_to is not None and p.season > season_to:
+            continue
+        if league_set is not None and p.lg not in league_set:
+            continue
+        result.append(p)
+    return result

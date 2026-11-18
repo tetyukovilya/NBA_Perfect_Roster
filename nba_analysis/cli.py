@@ -1,85 +1,83 @@
-"""Command-line interface for NBA analysis."""
+"""Командная строка: ``nba-analysis`` или ``python -m nba_analysis``."""
+from __future__ import annotations
+
 import argparse
-import sys
-from .main import main as run_analysis
-from .config import NUM_GAMES_SIM, CHEMISTRY_BONUS_WEIGHT, OUTPUT_PATH
+import time
+from dataclasses import replace
+
+from . import __version__
+from .config import AnalysisConfig, SimulationConfig
+from .pipeline import build_lineups, load_dataset, run_analysis
+from .reporter import generate_report, save_report
+
+QUICK_GAMES = 100
 
 
-def parse_args():
+def build_parser() -> argparse.ArgumentParser:
+    defaults = AnalysisConfig()
+    sim = SimulationConfig()
     parser = argparse.ArgumentParser(
-        description='NBA Historical Lineup Analysis and Simulation',
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter
+        prog="nba-analysis",
+        description="NBA historical lineup analysis and simulation",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument(
-        '--games', '-g', type=int, default=NUM_GAMES_SIM,
-        help='Number of games to simulate per matchup'
-    )
-    parser.add_argument(
-        '--chem-weight', '-c', type=float, default=CHEMISTRY_BONUS_WEIGHT,
-        help='Chemistry bonus weight (scale factor)'
-    )
-    parser.add_argument(
-        '--output', '-o', type=str, default=OUTPUT_PATH,
-        help='Output markdown file path'
-    )
-    parser.add_argument(
-        '--quick', '-q', action='store_true',
-        help='Quick mode: only 10 games per matchup for testing'
-    )
-    parser.add_argument(
-        '--list-lineups', '-l', action='store_true',
-        help='Only build and print lineups, skip simulation'
-    )
-    parser.add_argument(
-        '--version', '-v', action='version',
-        version='%(prog)s 2.0.0'
-    )
-    return parser.parse_args()
+    parser.add_argument("-g", "--games", type=int, default=sim.games, help="games per matchup")
+    parser.add_argument("-q", "--quick", action="store_true", help=f"only {QUICK_GAMES} games per matchup")
+    parser.add_argument("-c", "--chem-weight", type=float, default=sim.chemistry_weight,
+                        help="influence of chemistry on shot accuracy")
+    parser.add_argument("--seed", type=int, default=None, help="random seed for reproducible results")
+    parser.add_argument("--no-era-adjust", action="store_true", help="use raw TS%% instead of era-relative")
+    parser.add_argument("--min-minutes", type=float, default=defaults.min_minutes,
+                        help="minimum minutes played in a season")
+    parser.add_argument("--from", dest="season_from", type=int, default=None, help="first season")
+    parser.add_argument("--to", dest="season_to", type=int, default=None, help="last season")
+    parser.add_argument("--leagues", nargs="+", default=list(defaults.leagues), help="leagues to include")
+    parser.add_argument("-o", "--output", default=str(defaults.output_path), help="markdown report path")
+    parser.add_argument("-l", "--list-lineups", action="store_true", help="only print lineups, skip simulation")
+    parser.add_argument("-v", "--version", action="version", version=f"%(prog)s {__version__}")
+    return parser
 
 
-def main():
-    args = parse_args()
-    
-    if args.quick:
-        print('Quick mode: 10 games per matchup')
-        # Override the constant for this run
-        import nba_analysis.config as config
-        config.NUM_GAMES_SIM = 10
-        config.CHEMISTRY_BONUS_WEIGHT = args.chem_weight
-        config.OUTPUT_PATH = args.output
-    else:
-        import nba_analysis.config as config
-        config.NUM_GAMES_SIM = args.games
-        config.CHEMISTRY_BONUS_WEIGHT = args.chem_weight
-        config.OUTPUT_PATH = args.output
-    
+def config_from_args(args: argparse.Namespace) -> AnalysisConfig:
+    base = AnalysisConfig()
+    sim = replace(
+        base.simulation,
+        games=QUICK_GAMES if args.quick else args.games,
+        chemistry_weight=args.chem_weight,
+        era_adjust=not args.no_era_adjust,
+        seed=args.seed,
+    )
+    return replace(
+        base,
+        output_path=args.output,
+        min_minutes=args.min_minutes,
+        season_from=args.season_from,
+        season_to=args.season_to,
+        leagues=tuple(args.leagues),
+        simulation=sim,
+    )
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    cfg = config_from_args(args)
+
     if args.list_lineups:
-        from nba_analysis.data_loader import load_players, prepare_players
-        from nba_analysis.lineup_builder import lineup_by_position
-        
-        print('Loading players...')
-        players = load_players()
-        players = prepare_players(players)
-        
-        overall = lineup_by_position(players, 'ws')
-        offense = lineup_by_position(players, 'ows')
-        defense = lineup_by_position(players, 'dws')
-        
-        print('\n=== BEST OVERALL FIVE (WS) ===')
-        for i, p in enumerate(overall):
-            print(f'  {i+1}. {p.player} ({p.pos}) - WS: {p.ws:.2f}')
-        
-        print('\n=== BEST OFFENSIVE FIVE (OWS) ===')
-        for i, p in enumerate(offense):
-            print(f'  {i+1}. {p.player} ({p.pos}) - OWS: {p.ows:.2f}')
-        
-        print('\n=== BEST DEFENSIVE FIVE (DWS) ===')
-        for i, p in enumerate(defense):
-            print(f'  {i+1}. {p.player} ({p.pos}) - DWS: {p.dws:.2f}')
-        return
-    
-    run_analysis()
+        data = load_dataset(cfg)
+        for lineup in build_lineups(cfg, data):
+            print(f"\n=== {lineup.name} ({lineup.metric.upper()}) ===")
+            for pos, p in lineup.slots():
+                print(f"  {pos:<2}  {p.label:<40} {lineup.metric.upper()}: {getattr(p, lineup.metric):.2f}")
+        return 0
+
+    started = time.perf_counter()
+    result = run_analysis(cfg, log=print)
+    for name, diff in sorted(result.avg_diff.items(), key=lambda kv: -kv[1]):
+        print(f"{name:<10} {diff:+.2f} avg point diff")
+    save_report(generate_report(result), cfg.output_path)
+    print(f"Report written to {cfg.output_path} ({time.perf_counter() - started:.1f}s)")
+    return 0
 
 
-if __name__ == '__main__':
-    main()
+if __name__ == "__main__":
+    raise SystemExit(main())

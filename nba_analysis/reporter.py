@@ -1,67 +1,77 @@
-"""Report generation in Markdown format."""
-from typing import List
-from .models import Player, Lineup
-from .config import STANDARD_POSITIONS
+"""Markdown-отчёт по результатам анализа."""
+from __future__ import annotations
+
+from pathlib import Path
+
+from .models import Lineup
+from .pipeline import AnalysisResult
+
+_METRIC_TITLES = {
+    "ws": "Win Shares",
+    "ows": "Offensive Win Shares",
+    "dws": "Defensive Win Shares",
+}
 
 
-def format_md_lineup(five: List[Player], metric: str) -> str:
-    """Format a lineup as markdown (without title header)."""
-    lines = []
-    for idx, p in enumerate(five):
-        assigned_pos = STANDARD_POSITIONS[idx] if idx < len(STANDARD_POSITIONS) else 'N/A'
-        original_pos = p.original_pos
-        lines.append(
-            f'{idx+1}. **{p.player}** (Assigned Pos: {assigned_pos}, Original Pos: {original_pos}, '
-            f'{p.team}, {p.season} {p.lg}) '
-            f'{metric.upper()}:{p.get_metric(metric):.2f} | '
-            f'OBPM:{p.obpm:.2f} DBPM:{p.dbpm:.2f} '
-            f'VORP:{p.vorp:.2f} PER:{p.per:.1f}'
-        )
-    lines.append('')
-    return '\n'.join(lines)
+def _fmt(value: float | None, spec: str = ".1f") -> str:
+    return "—" if value is None else format(value, spec)
 
 
-def format_md_simulation_results(results: dict, games: int, chem_weight: float) -> str:
-    """Format simulation results as markdown."""
+def format_lineup(lineup: Lineup) -> str:
+    title = _METRIC_TITLES.get(lineup.metric, lineup.metric.upper())
+    metric = lineup.metric.upper()
     lines = [
-        '# Simulation Results (Chemistry Adjusted)',
-        f'Each lineup simulated {games} games against each of the other two lineups.',
-        f'Chemistry bonus weight: {chem_weight} (scale factor).',
-        ''
+        f"## {lineup.name} — {title}",
+        "",
+        f"| Pos | Player | Season | Team | Orig. pos | {metric} | OBPM | DBPM | VORP | PER | TS% | USG% |",
+        "|---|---|---|---|---|---|---|---|---|---|---|---|",
     ]
-    
-    for name, data in results.items():
-        lines.append(f'## {name} Lineup')
-        lines.append(f'Average point difference per game vs other lineups: {data["avg_diff"]:.2f} points')
-        lines.append('')
-    
-    return '\n'.join(lines)
+    for pos, p in lineup.slots():
+        lines.append(
+            f"| {pos} | **{p.name}** | {p.season} {p.lg} | {p.team} | {p.original_pos or '—'} "
+            f"| {_fmt(getattr(p, lineup.metric), '.2f')} | {_fmt(p.obpm)} | {_fmt(p.dbpm)} "
+            f"| {_fmt(p.vorp)} | {_fmt(p.per)} | {_fmt(p.ts_percent, '.3f')} | {_fmt(p.usg_percent)} |"
+        )
+    return "\n".join(lines)
 
 
-def generate_report(lineups: List[Lineup], sim_results: dict, 
-                    games: int, chem_weight: float) -> str:
-    """Generate full markdown report."""
-    md_lines = []
-    
-    title_map = {
-        'ws': 'Best Overall Five (Win Shares) – All Time (One per Position)',
-        'ows': 'Best Offensive Five (Offensive Win Shares) – All Time (One per Position)',
-        'dws': 'Best Defensive Five (Defensive Win Shares) – All Time (One per Position)',
-    }
-    
-    # Lineups
-    for lineup in lineups:
-        title = title_map.get(lineup.metric, f'Best {lineup.metric.upper()} Five')
-        md_lines.append(f'# {title}')
-        md_lines.append(format_md_lineup(lineup.players, lineup.metric))
-    
-    # Simulation
-    md_lines.append(format_md_simulation_results(sim_results, games, chem_weight))
-    
-    return '\n'.join(md_lines)
+def format_simulation(result: AnalysisResult) -> str:
+    sim = result.config.simulation
+    lines = [
+        "# Simulation",
+        "",
+        f"{sim.games} games per matchup, {sim.possessions_per_game} possessions per team, "
+        f"chemistry weight {sim.chemistry_weight}, era adjustment {'on' if sim.era_adjust else 'off'}, "
+        f"seed {sim.seed}.",
+        "",
+        "| Matchup | Avg score | Win % (first) | Avg diff ± SE |",
+        "|---|---|---|---|",
+    ]
+    for r in result.matchups:
+        lines.append(
+            f"| {r.team_a} vs {r.team_b} | {r.avg_score_a:.1f} : {r.avg_score_b:.1f} "
+            f"| {r.win_pct_a:.1%} | {r.mean_diff:+.2f} ± {r.stderr_diff:.2f} |"
+        )
+    lines += ["", "| Lineup | Avg point diff vs others |", "|---|---|"]
+    for name, diff in sorted(result.avg_diff.items(), key=lambda kv: -kv[1]):
+        lines.append(f"| {name} | {diff:+.2f} |")
+    return "\n".join(lines)
 
 
-def save_report(content: str, output_path: str) -> None:
-    """Save report to file."""
-    with open(output_path, 'w', encoding='utf-8') as f:
-        f.write(content)
+def generate_report(result: AnalysisResult) -> str:
+    cfg = result.config
+    seasons = f"{cfg.season_from or 'all'}–{cfg.season_to or 'now'}"
+    parts = [
+        "# Best Starting Fives — All Time (one player per position)",
+        "",
+        f"Seasons: {seasons}; leagues: {', '.join(cfg.leagues)}; min minutes: {cfg.min_minutes:g}.",
+        "",
+    ]
+    for lineup in result.lineups:
+        parts += [format_lineup(lineup), ""]
+    parts.append(format_simulation(result))
+    return "\n".join(parts) + "\n"
+
+
+def save_report(content: str, path: Path | str) -> None:
+    Path(path).write_text(content, encoding="utf-8")

@@ -1,2 +1,0 @@
-[console_scripts]
-nba-analysis = nba_analysis.cli:main

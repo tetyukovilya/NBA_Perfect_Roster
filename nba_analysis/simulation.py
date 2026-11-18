@@ -1,138 +1,218 @@
-"""Game simulation logic."""
+"""Монте-Карло симуляция матчей между пятёрками.
+
+Модель одного владения (все вероятности — из PlayerProfile):
+
+1. Игрок, на котором заканчивается розыгрыш, выбирается пропорционально USG%.
+2. Потеря: P = TOV% игрока × (STL% обороны / средний STL% лиги).
+3. Поход на линию штрафных (по FTr) или бросок с игры: 3-очковый с
+   вероятностью 3PAr, точность из TS% (через eFG%), умноженная на бонус химии
+   и на фактор обороны (сумма DBPM пятёрки соперника).
+4. Промах -> подбор: P(в нападении) = ΣORB% / (ΣORB% + ΣDRB%).
+   Подбор в нападении продолжает то же владение.
+
+В каждой игре у каждой команды ровно ``possessions_per_game`` владений,
+при ничьей играются овертаймы.
+"""
+from __future__ import annotations
+
+import bisect
+import math
 import random
-from typing import List, Optional, Dict, Tuple
-from .models import Player, Lineup
-from .config import (
-    LEAGUE_FG, POSSESSIONS_PER_GAME, NUM_GAMES_SIM,
-    SHOT_PROB_MIN, SHOT_PROB_MAX
-)
-from .chemistry import get_team_chemistry_sum, clear_chemistry_cache
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
+from itertools import accumulate, combinations
+
+from .chemistry import ChemistryModel
+from .config import SimulationConfig
+from .models import Lineup
+from .profiles import FTA_POSSESSION_FACTOR, LeagueContext, PlayerProfile, build_profile
+
+# В среднем за «поход на линию» бросается 1/0.44 ≈ 2.27 штрафных.
+EXTRA_FT_PROB = 1 / FTA_POSSESSION_FACTOR - 2
+OVERTIME_POSSESSIONS = 10
+MAX_OVERTIMES = 5
 
 
-def possession(offense: List[Player], defense: List[Player], 
-               chem_bonus: float, co_minutes_dict: Dict[Tuple[str, str], float]) -> Tuple[int, Optional[str]]:
-    """Simulate one possession; return points scored by offense and which team gets rebound if miss."""
-    # Choose ball handler weighted by usage
-    ball_handler = random.choices(offense, weights=[p.usage for p in offense])[0]
-    # Choose defender weighted by defensive skill
-    defender = random.choices(defense, weights=[p.defs for p in defense])[0]
-    
-    # Base success probability
-    p_shot = ball_handler.offs * (1 - defender.defs) * LEAGUE_FG
-    
-    # Chemistry boost from teammates on floor (excluding ball handler) - cached
-    chem = get_team_chemistry_sum(ball_handler, offense, co_minutes_dict)
-    p_shot *= (1 + chem_bonus * chem)  # chem_bonus scales overall chemistry influence
-    
-    # Clamp
-    p_shot = max(SHOT_PROB_MIN, min(SHOT_PROB_MAX, p_shot))
-    
-    if random.random() < p_shot:
-        # Made shot
-        pts = 3 if random.random() < ball_handler.x3p else 2
-        return pts, None  # no rebound
-    else:
-        # Missed shot -> rebound
-        off_reb = sum(p.orb for p in offense)
-        def_reb = sum(p.drb for p in defense)
-        total = off_reb + def_reb
-        if total == 0:
-            reb_team = random.choice(['off', 'def'])
+def _clamp(x: float, lo: float, hi: float) -> float:
+    return lo if x < lo else hi if x > hi else x
+
+
+@dataclass(frozen=True, slots=True)
+class TeamState:
+    """Предрасчитанные параметры пятёрки, чтобы не считать их в каждом владении."""
+
+    name: str
+    profiles: tuple[PlayerProfile, ...]
+    cum_usage: tuple[float, ...]   # накопленные веса USG% для выбора игрока
+    make_mult: tuple[float, ...]   # бонус химии к точности для каждого игрока
+    orb: float                     # Σ ORB%
+    drb: float                     # Σ DRB%
+    # Как эта пятёрка влияет на соперника, когда обороняется:
+    defense_factor: float          # множитель к точности бросков соперника
+    steal_factor: float            # множитель к потерям соперника
+
+
+@dataclass(frozen=True, slots=True)
+class MatchupResult:
+    team_a: str
+    team_b: str
+    games: int
+    wins_a: int
+    wins_b: int
+    avg_score_a: float
+    avg_score_b: float
+    mean_diff: float     # средняя разница (A - B) за игру
+    std_diff: float
+
+    @property
+    def win_pct_a(self) -> float:
+        return self.wins_a / self.games if self.games else 0.0
+
+    @property
+    def stderr_diff(self) -> float:
+        return self.std_diff / math.sqrt(self.games) if self.games else 0.0
+
+
+class Simulator:
+    def __init__(
+        self,
+        ctx: LeagueContext,
+        cfg: SimulationConfig | None = None,
+        chemistry: ChemistryModel | None = None,
+        rng: random.Random | None = None,
+    ):
+        self.ctx = ctx
+        self.cfg = cfg or SimulationConfig()
+        self.chemistry = chemistry
+        self.rng = rng or random.Random(self.cfg.seed)
+        self._league_stl = ctx.global_avg("stl_percent") or 1.0
+
+    # --- подготовка -------------------------------------------------------
+    def team_state(self, lineup: Lineup) -> TeamState:
+        cfg = self.cfg
+        profiles = tuple(build_profile(p, self.ctx, cfg) for p in lineup.players)
+        if self.chemistry is not None and cfg.chemistry_weight:
+            make_mult = tuple(
+                1.0 + cfg.chemistry_weight * self.chemistry.handler_bonus(h, profiles)
+                for h in profiles
+            )
         else:
-            if random.random() < off_reb / total:
-                reb_team = 'off'
+            make_mult = (1.0,) * len(profiles)
+
+        dbpm_sum = sum(p.dbpm for p in profiles)
+        mean_stl = sum(p.stl for p in profiles) / len(profiles)
+        return TeamState(
+            name=lineup.name,
+            profiles=profiles,
+            cum_usage=tuple(accumulate(p.usage for p in profiles)),
+            make_mult=make_mult,
+            orb=sum(p.orb for p in profiles),
+            drb=sum(p.drb for p in profiles),
+            defense_factor=_clamp(
+                1 - cfg.defense_scale * dbpm_sum / (100 * cfg.league_points_per_possession),
+                0.6, 1.4,
+            ),
+            steal_factor=_clamp(mean_stl / self._league_stl, 0.5, 2.0),
+        )
+
+    # --- игра -------------------------------------------------------------
+    def possession(self, off: TeamState, dfn: TeamState) -> int:
+        """Одно владение (включая подборы в нападении); возвращает очки."""
+        rng = self.rng
+        cfg = self.cfg
+        p_oreb = off.orb / (off.orb + dfn.drb) if (off.orb + dfn.drb) > 0 else 0.25
+        points = 0
+        for _ in range(cfg.max_offensive_rebounds + 1):
+            i = bisect.bisect_right(off.cum_usage, rng.random() * off.cum_usage[-1])
+            i = min(i, len(off.profiles) - 1)
+            h = off.profiles[i]
+
+            if rng.random() < h.tov_rate * dfn.steal_factor:
+                return points
+
+            if rng.random() < h.ft_trip_rate:
+                attempts = 3 if rng.random() < EXTRA_FT_PROB else 2
+                made = False
+                for _ in range(attempts):
+                    made = rng.random() < cfg.league_ft_pct
+                    points += made
+                if made:
+                    return points
             else:
-                reb_team = 'def'
-        return 0, reb_team
+                is_three = rng.random() < h.three_rate
+                p_make = (h.p3 if is_three else h.p2) * off.make_mult[i] * dfn.defense_factor
+                if rng.random() < min(p_make, cfg.max_make_prob):
+                    return points + (3 if is_three else 2)
 
+            if rng.random() >= p_oreb:  # подбор в защите
+                return points
+        return points
 
-def simulate_game(lineup_a: List[Player], lineup_b: List[Player], 
-                  chem_bonus: float = 0.1, possessions: int = POSSESSIONS_PER_GAME,
-                  co_minutes_dict: Optional[Dict[Tuple[str, str], float]] = None) -> Tuple[int, int]:
-    """Simulate a full game between two lineups."""
-    if co_minutes_dict is None:
-        co_minutes_dict = {}
-    
-    score_a = 0
-    score_b = 0
-    
-    # Track possession properly: offensive rebound doesn't count as new possession
-    possessions_played = 0
-    offense_has_ball = True  # True = lineup_a has ball, False = lineup_b has ball
-    
-    while possessions_played < possessions:
-        if offense_has_ball:
-            pts, reb = possession(lineup_a, lineup_b, chem_bonus, co_minutes_dict)
-            score_a += pts
-        else:
-            pts, reb = possession(lineup_b, lineup_a, chem_bonus, co_minutes_dict)
-            score_b += pts
-        
-        if reb is None:
-            # Made shot - possession ends, other team gets ball
-            offense_has_ball = not offense_has_ball
-            possessions_played += 1
-        elif reb == 'off':
-            # Offensive rebound - same team keeps ball, possession continues
-            pass
-        else:
-            # Defensive rebound - other team gets ball
-            offense_has_ball = not offense_has_ball
-            possessions_played += 1
-    
-    return score_a, score_b
+    def _play_possessions(self, a: TeamState, b: TeamState, n: int) -> tuple[int, int]:
+        score_a = score_b = 0
+        for _ in range(n):
+            score_a += self.possession(a, b)
+            score_b += self.possession(b, a)
+        return score_a, score_b
 
+    def play_game(self, a: TeamState, b: TeamState) -> tuple[int, int]:
+        score_a, score_b = self._play_possessions(a, b, self.cfg.possessions_per_game)
+        for _ in range(MAX_OVERTIMES):
+            if score_a != score_b:
+                break
+            ot_a, ot_b = self._play_possessions(a, b, OVERTIME_POSSESSIONS // 2)
+            score_a += ot_a
+            score_b += ot_b
+        return score_a, score_b
 
-def evaluate_lineup(lineup: List[Player], opponents: List[List[Player]], 
-                    chem_bonus: float = 0.1, games: int = NUM_GAMES_SIM,
-                    co_minutes_dict: Optional[Dict[Tuple[str, str], float]] = None) -> float:
-    """Play 'games' number of games against each opponent lineup, return average point difference."""
-    if co_minutes_dict is None:
-        co_minutes_dict = {}
-    
-    clear_chemistry_cache()  # Clear cache since team composition changes
-    
-    total_diff = 0.0
-    total_games = 0
-    
-    for opp in opponents:
+    def play_series(self, lineup_a: Lineup, lineup_b: Lineup, games: int | None = None) -> MatchupResult:
+        games = self.cfg.games if games is None else games
+        a, b = self.team_state(lineup_a), self.team_state(lineup_b)
+        wins_a = wins_b = 0
+        sum_a = sum_b = 0
+        sum_d = sum_d2 = 0.0
         for _ in range(games):
-            a, b = simulate_game(lineup, opp, chem_bonus, co_minutes_dict=co_minutes_dict)
-            total_diff += (a - b)
-            total_games += 1
-    
-    return total_diff / total_games if total_games else 0.0
+            sa, sb = self.play_game(a, b)
+            sum_a += sa
+            sum_b += sb
+            d = sa - sb
+            sum_d += d
+            sum_d2 += d * d
+            if d > 0:
+                wins_a += 1
+            elif d < 0:
+                wins_b += 1
+        n = max(games, 1)
+        mean = sum_d / n
+        var = max(sum_d2 / n - mean * mean, 0.0)
+        return MatchupResult(
+            team_a=lineup_a.name, team_b=lineup_b.name, games=games,
+            wins_a=wins_a, wins_b=wins_b,
+            avg_score_a=sum_a / n, avg_score_b=sum_b / n,
+            mean_diff=mean, std_diff=math.sqrt(var),
+        )
 
 
-def simulate_matchup(lineup_a: List[Player], lineup_b: List[Player],
-                     chem_bonus: float = 0.1, games: int = NUM_GAMES_SIM,
-                     co_minutes_dict: Optional[Dict[Tuple[str, str], float]] = None) -> Dict:
-    """Simulate a series between two lineups and return detailed results."""
-    if co_minutes_dict is None:
-        co_minutes_dict = {}
-    
-    clear_chemistry_cache()
-    
-    wins_a = 0
-    wins_b = 0
-    total_diff = 0.0
-    scores_a = []
-    scores_b = []
-    
-    for _ in range(games):
-        a, b = simulate_game(lineup_a, lineup_b, chem_bonus, co_minutes_dict=co_minutes_dict)
-        scores_a.append(a)
-        scores_b.append(b)
-        total_diff += (a - b)
-        if a > b:
-            wins_a += 1
-        elif b > a:
-            wins_b += 1
-    
-    return {
-        'lineup_a_wins': wins_a,
-        'lineup_b_wins': wins_b,
-        'avg_point_diff': total_diff / games if games else 0.0,
-        'avg_score_a': sum(scores_a) / len(scores_a) if scores_a else 0.0,
-        'avg_score_b': sum(scores_b) / len(scores_b) if scores_b else 0.0,
-    }
+def round_robin(
+    simulator: Simulator,
+    lineups: Sequence[Lineup],
+    games: int | None = None,
+    progress: Callable[[MatchupResult], None] | None = None,
+) -> list[MatchupResult]:
+    """Каждая пара пятёрок играет одну серию."""
+    results = []
+    for a, b in combinations(lineups, 2):
+        result = simulator.play_series(a, b, games)
+        results.append(result)
+        if progress:
+            progress(result)
+    return results
+
+
+def average_point_diff(results: Sequence[MatchupResult]) -> dict[str, float]:
+    """Средняя разница очков каждой пятёрки против всех остальных."""
+    totals: dict[str, list[float]] = {}
+    for r in results:
+        totals.setdefault(r.team_a, []).append(r.mean_diff)
+        totals.setdefault(r.team_b, []).append(-r.mean_diff)
+    return {name: sum(v) / len(v) for name, v in totals.items()}

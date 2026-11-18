@@ -1,19 +1,19 @@
-"""Chemistry calculation between players."""
+"""Парная «химия» игроков: схожесть стиля, сыгранность и конфликт за мяч."""
+from __future__ import annotations
+
 import math
-from typing import Dict, List, Tuple
+from collections import defaultdict
+from collections.abc import Iterable, Sequence
+
+from .config import ChemistryConfig
 from .models import Player
-from .config import (
-    W_SIM, W_CO, W_USG_DIFF,
-    CHEM_MIN, CHEM_MAX
-)
+from .profiles import PlayerProfile
 
-# Global cache for chemistry calculations
-_chemistry_cache: Dict[Tuple[str, str], float] = {}
-_team_chem_cache: Dict[Tuple[str, Tuple[str, ...]], float] = {}
+# Средний USG% игрока на площадке — 20% (5 игроков делят 100% владений).
+AVERAGE_USAGE = 0.20
 
 
-def cosine_similarity(v1: List[float], v2: List[float]) -> float:
-    """Calculate cosine similarity between two vectors."""
+def cosine_similarity(v1: Sequence[float], v2: Sequence[float]) -> float:
     dot = sum(a * b for a, b in zip(v1, v2))
     norm1 = math.sqrt(sum(a * a for a in v1))
     norm2 = math.sqrt(sum(b * b for b in v2))
@@ -22,40 +22,65 @@ def cosine_similarity(v1: List[float], v2: List[float]) -> float:
     return dot / (norm1 * norm2)
 
 
-def chemistry(p1: Player, p2: Player, co_minutes_dict: Dict[Tuple[str, str], float]) -> float:
-    """Chemistry bonus between two players (-0.5 to 0.5). Cached."""
-    key = (p1.player, p2.player)
-    if key in _chemistry_cache:
-        return _chemistry_cache[key]
-    
-    sim = cosine_similarity(p1.vec, p2.vec)
-    co = co_minutes_dict.get((p1.player, p2.player), 0.0)
-    co_log = math.log1p(co)  # log(1+co)
-    usg_diff = abs(p1.usage - p2.usage)
-    bonus = W_SIM * sim + W_CO * co_log - W_USG_DIFF * usg_diff
-    result = max(CHEM_MIN, min(CHEM_MAX, bonus))
-    _chemistry_cache[key] = result
-    return result
+def compute_shared_minutes(team_rows: Iterable[Player]) -> dict[tuple[str, str], float]:
+    """Оценка совместных минут для каждой пары игроков (по player_id).
+
+    Для одноклубников в сезоне берём min(MP_i, MP_j) — верхнюю оценку
+    (точных данных по пятёркам в датасете нет). Суммарные строки (2TM)
+    сюда не должны попадать, иначе все обменянные за сезон игроки
+    окажутся «одноклубниками».
+    """
+    groups: dict[tuple, list[Player]] = defaultdict(list)
+    for p in team_rows:
+        if p.is_aggregate or not p.mp:
+            continue
+        groups[(p.season, p.lg, p.team)].append(p)
+
+    shared: dict[tuple[str, str], float] = defaultdict(float)
+    for group in groups.values():
+        for i, a in enumerate(group):
+            for b in group[i + 1:]:
+                if a.player_id != b.player_id:
+                    shared[pair_key(a.player_id, b.player_id)] += min(a.mp, b.mp)
+    return dict(shared)
 
 
-def get_team_chemistry_sum(ball_handler: Player, offense: List[Player], 
-                           co_minutes_dict: Dict[Tuple[str, str], float]) -> float:
-    """Cached sum of chemistry between ball_handler and all teammates."""
-    team_players = tuple(sorted(p.player for p in offense))
-    key = (ball_handler.player, team_players)
-    if key in _team_chem_cache:
-        return _team_chem_cache[key]
-    
-    chem_sum = sum(
-        chemistry(ball_handler, teammate, co_minutes_dict)
-        for teammate in offense if teammate is not ball_handler
-    )
-    _team_chem_cache[key] = chem_sum
-    return chem_sum
+def pair_key(a: str, b: str) -> tuple[str, str]:
+    return (a, b) if a <= b else (b, a)
 
 
-def clear_chemistry_cache() -> None:
-    """Clear the chemistry cache between simulation runs."""
-    global _chemistry_cache, _team_chem_cache
-    _chemistry_cache = {}
-    _team_chem_cache = {}
+class ChemistryModel:
+    """Считает химию пар и бонус для игрока с мячом. Кэш — на экземпляре."""
+
+    def __init__(self, shared_minutes: dict[tuple[str, str], float], cfg: ChemistryConfig | None = None):
+        self.shared_minutes = shared_minutes
+        self.cfg = cfg or ChemistryConfig()
+        self._log_saturation = math.log1p(self.cfg.familiarity_saturation_minutes)
+        self._cache: dict[tuple[str, str], float] = {}
+
+    def familiarity(self, a_id: str, b_id: str) -> float:
+        """0..1: насколько игроки сыграны (лог-шкала совместных минут)."""
+        minutes = self.shared_minutes.get(pair_key(a_id, b_id), 0.0)
+        return min(1.0, math.log1p(minutes) / self._log_saturation)
+
+    def pair(self, a: PlayerProfile, b: PlayerProfile) -> float:
+        key = pair_key(a.player_id, b.player_id)
+        if key in self._cache:
+            return self._cache[key]
+        cfg = self.cfg
+        usage_overlap = max(0.0, a.usage + b.usage - 2 * AVERAGE_USAGE)
+        value = (
+            cfg.w_similarity * cosine_similarity(a.style, b.style)
+            + cfg.w_familiarity * self.familiarity(a.player_id, b.player_id)
+            - cfg.w_usage_overlap * usage_overlap
+        )
+        value = min(cfg.chem_max, max(cfg.chem_min, value))
+        self._cache[key] = value
+        return value
+
+    def handler_bonus(self, handler: PlayerProfile, lineup: Sequence[PlayerProfile]) -> float:
+        """Средняя химия игрока с мячом с четырьмя партнёрами."""
+        mates = [p for p in lineup if p.player_id != handler.player_id]
+        if not mates:
+            return 0.0
+        return sum(self.pair(handler, m) for m in mates) / len(mates)
